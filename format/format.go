@@ -3,6 +3,7 @@ package format
 import (
 	"github.com/deepch/vdk/av/avutil"
 	"github.com/deepch/vdk/format/aac"
+	"github.com/deepch/vdk/format/avi"
 	"github.com/deepch/vdk/format/flv"
 	"github.com/deepch/vdk/format/mp4"
 	"github.com/deepch/vdk/format/rtmp"
@@ -17,4 +18,5 @@ func RegisterAll() {
 	avutil.DefaultHandlers.Add(rtsp.Handler)
 	avutil.DefaultHandlers.Add(flv.Handler)
 	avutil.DefaultHandlers.Add(aac.Handler)
+	avutil.DefaultHandlers.Add(avi.Handler)
 }
