@@ -1,7 +1,6 @@
 package avi
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -15,7 +14,7 @@ import (
 )
 
 type Muxer struct {
-	w               *bufio.Writer
+	ws              io.WriteSeeker
 	codecData       []av.CodecData
 	videoStreamIdx  int
 	audioStreamIdx  int
@@ -32,9 +31,9 @@ type Muxer struct {
 	audioSampleRate uint32
 }
 
-func NewMuxer(w io.Writer) *Muxer {
+func NewMuxer(ws io.WriteSeeker) *Muxer {
 	return &Muxer{
-		w:              bufio.NewWriter(w),
+		ws:             ws,
 		videoStreamIdx: -1,
 		audioStreamIdx: -1,
 	}
@@ -96,15 +95,19 @@ func (m *Muxer) WriteHeader(codecData []av.CodecData) error {
 
 func (m *Muxer) writeFileHeaders() error {
 	// Save position for later update
-	m.headerPos = 0
+	var err error
+	m.headerPos, err = m.ws.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
 
 	// Write RIFF header (will update size later)
-	if err := aviio.WriteChunkHeader(m.w, aviio.FourCCRIFF, 0); err != nil {
+	if err := aviio.WriteChunkHeader(m.ws, aviio.FourCCRIFF, 0); err != nil {
 		return err
 	}
 
 	// Write AVI signature
-	if err := binary.Write(m.w, binary.LittleEndian, aviio.FourCCAVI); err != nil {
+	if err := binary.Write(m.ws, binary.LittleEndian, aviio.FourCCAVI); err != nil {
 		return err
 	}
 
@@ -114,15 +117,18 @@ func (m *Muxer) writeFileHeaders() error {
 	}
 
 	// Write movi list header
-	m.moviListPos = m.getPosition()
-	if err := aviio.WriteChunkHeader(m.w, aviio.FourCCLIST, 0); err != nil {
+	m.moviListPos, err = m.ws.Seek(0, io.SeekCurrent)
+	if err != nil {
 		return err
 	}
-	if err := binary.Write(m.w, binary.LittleEndian, aviio.FourCCmovi); err != nil {
+	if err := aviio.WriteChunkHeader(m.ws, aviio.FourCCLIST, 0); err != nil {
+		return err
+	}
+	if err := binary.Write(m.ws, binary.LittleEndian, aviio.FourCCmovi); err != nil {
 		return err
 	}
 
-	return m.w.Flush()
+	return nil
 }
 
 func (m *Muxer) writeHeaderList() error {
@@ -149,15 +155,15 @@ func (m *Muxer) writeHeaderList() error {
 	}
 
 	// Write LIST header
-	if err := aviio.WriteChunkHeader(m.w, aviio.FourCCLIST, uint32(headerBuf.Len()+4)); err != nil {
+	if err := aviio.WriteChunkHeader(m.ws, aviio.FourCCLIST, uint32(headerBuf.Len()+4)); err != nil {
 		return err
 	}
-	if err := binary.Write(m.w, binary.LittleEndian, aviio.FourCChdrl); err != nil {
+	if err := binary.Write(m.ws, binary.LittleEndian, aviio.FourCChdrl); err != nil {
 		return err
 	}
 
 	// Write buffered content
-	_, err := m.w.Write(headerBuf.Bytes())
+	_, err := m.ws.Write(headerBuf.Bytes())
 	return err
 }
 
@@ -388,10 +394,14 @@ func (m *Muxer) WritePacket(pkt av.Packet) error {
 	}
 
 	// Record index entry
+	currentPos, err := m.getPosition()
+	if err != nil {
+		return err
+	}
 	indexEntry := aviio.IndexEntry{
 		ChunkID: chunkID,
 		Flags:   0,
-		Offset:  uint32(m.getPosition() - m.moviListPos - 4),
+		Offset:  uint32(currentPos - m.moviListPos - 12), // -12 = LIST header (8) + "movi" (4)
 		Size:    uint32(len(pkt.Data)),
 	}
 
@@ -402,18 +412,18 @@ func (m *Muxer) WritePacket(pkt av.Packet) error {
 	m.indexEntries = append(m.indexEntries, indexEntry)
 
 	// Write chunk header
-	if err := aviio.WriteChunkHeader(m.w, chunkID, uint32(len(pkt.Data))); err != nil {
+	if err := aviio.WriteChunkHeader(m.ws, chunkID, uint32(len(pkt.Data))); err != nil {
 		return err
 	}
 
 	// Write data
-	if _, err := m.w.Write(pkt.Data); err != nil {
+	if _, err := m.ws.Write(pkt.Data); err != nil {
 		return err
 	}
 
 	// Align to word boundary
 	if len(pkt.Data)&1 == 1 {
-		if err := m.w.WriteByte(0); err != nil {
+		if _, err := m.ws.Write([]byte{0}); err != nil {
 			return err
 		}
 	}
@@ -436,8 +446,14 @@ func (m *Muxer) WriteTrailer() error {
 		return err
 	}
 
+	// Get current position for total size calculation
+	currentPos, err := m.ws.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
 	// Update file size in RIFF header
-	totalSize := m.getPosition() - 8
+	totalSize := currentPos - 8
 	if err := m.updateUint32At(4, uint32(totalSize)); err != nil {
 		return err
 	}
@@ -453,19 +469,24 @@ func (m *Muxer) WriteTrailer() error {
 		return err
 	}
 
-	return m.w.Flush()
+	// If using WriterSeeker wrapper, flush to underlying writer
+	if flusher, ok := m.ws.(interface{ Flush() error }); ok {
+		return flusher.Flush()
+	}
+
+	return nil
 }
 
 func (m *Muxer) writeIndex() error {
 	// Write idx1 chunk
 	indexSize := uint32(len(m.indexEntries) * 16)
-	if err := aviio.WriteChunkHeader(m.w, aviio.FourCCidx1, indexSize); err != nil {
+	if err := aviio.WriteChunkHeader(m.ws, aviio.FourCCidx1, indexSize); err != nil {
 		return err
 	}
 
 	// Write all index entries
 	for _, entry := range m.indexEntries {
-		if err := binary.Write(m.w, binary.LittleEndian, &entry); err != nil {
+		if err := binary.Write(m.ws, binary.LittleEndian, &entry); err != nil {
 			return err
 		}
 	}
@@ -473,15 +494,28 @@ func (m *Muxer) writeIndex() error {
 	return nil
 }
 
-func (m *Muxer) getPosition() int64 {
-	// In a real implementation, this would track the actual file position
-	// For now, we'll use a simple counter
-	return int64(m.dataSize) + m.moviListPos + 8
+func (m *Muxer) getPosition() (int64, error) {
+	return m.ws.Seek(0, io.SeekCurrent)
 }
 
 func (m *Muxer) updateUint32At(offset int64, value uint32) error {
-	// In a real implementation, this would seek and update
-	// For buffered writer, we'd need to flush and use a seeker
-	// This is a simplified version
-	return nil
+	// Save current position
+	currentPos, err := m.ws.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	// Seek to offset
+	if _, err := m.ws.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+
+	// Write value
+	if err := binary.Write(m.ws, binary.LittleEndian, value); err != nil {
+		return err
+	}
+
+	// Restore position
+	_, err = m.ws.Seek(currentPos, io.SeekStart)
+	return err
 }

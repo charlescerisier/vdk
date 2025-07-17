@@ -1,9 +1,9 @@
 package avi
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"time"
 
@@ -16,13 +16,14 @@ import (
 )
 
 type Demuxer struct {
-	r            *bufio.Reader
+	r            io.ReadSeeker
 	streams      []av.CodecData
 	mainHeader   *aviio.MainAVIHeader
 	streamInfos  []streamInfo
 	indexEntries []aviio.IndexEntry
 	moviOffset   int64
 	currentFrame int
+	fileSize     int64
 }
 
 type streamInfo struct {
@@ -34,9 +35,14 @@ type streamInfo struct {
 }
 
 func NewDemuxer(r io.Reader) *Demuxer {
-	return &Demuxer{
-		r: bufio.NewReader(r),
+	if rs, ok := r.(io.ReadSeeker); ok {
+		return &Demuxer{
+			r: rs,
+		}
 	}
+	// For non-seeking readers, we'd need a different approach
+	// For now, assume we have a seeker
+	panic("AVI demuxer requires io.ReadSeeker")
 }
 
 func (d *Demuxer) Streams() ([]av.CodecData, error) {
@@ -97,15 +103,15 @@ func (d *Demuxer) parseHeaders() error {
 				}
 			case aviio.FourCCmovi:
 				// Record offset to movi chunk for later seeking
-				d.moviOffset, _ = d.getPosition()
-				d.moviOffset -= 4 // Account for LIST type we already read
+				current, _ := d.r.Seek(0, io.SeekCurrent)
+				d.moviOffset = current // Point to start of movi chunk data (after LIST+movi)
 				// Skip the movi chunk for now
-				if _, err := d.r.Discard(int(header.Size - 4)); err != nil {
+				if _, err := d.r.Seek(int64(header.Size-4), io.SeekCurrent); err != nil {
 					return err
 				}
 			default:
 				// Skip unknown LIST chunks
-				if _, err := d.r.Discard(int(header.Size - 4)); err != nil {
+				if _, err := d.r.Seek(int64(header.Size-4), io.SeekCurrent); err != nil {
 					return err
 				}
 			}
@@ -120,14 +126,14 @@ func (d *Demuxer) parseHeaders() error {
 
 		default:
 			// Skip unknown chunks
-			if _, err := d.r.Discard(int(header.Size)); err != nil {
+			if _, err := d.r.Seek(int64(header.Size), io.SeekCurrent); err != nil {
 				return err
 			}
 		}
 
 		// Align to word boundary
 		if header.Size&1 == 1 {
-			d.r.ReadByte()
+			d.r.Seek(1, io.SeekCurrent)
 		}
 	}
 }
@@ -160,13 +166,13 @@ func (d *Demuxer) parseHdrlList(size uint32) error {
 				}
 			} else {
 				// Skip unknown LIST
-				if _, err := d.r.Discard(int(header.Size - 4)); err != nil {
+				if _, err := d.r.Seek(int64(header.Size-4), io.SeekCurrent); err != nil {
 					return err
 				}
 			}
 		default:
 			// Skip unknown chunks
-			if _, err := d.r.Discard(int(header.Size)); err != nil {
+			if _, err := d.r.Seek(int64(header.Size), io.SeekCurrent); err != nil {
 				return err
 			}
 		}
@@ -174,7 +180,7 @@ func (d *Demuxer) parseHdrlList(size uint32) error {
 		bytesRead += header.Size
 		// Align to word boundary
 		if header.Size&1 == 1 {
-			d.r.ReadByte()
+			d.r.Seek(1, io.SeekCurrent)
 			bytesRead++
 		}
 	}
@@ -307,7 +313,7 @@ func (d *Demuxer) parseStrlList(size uint32) error {
 
 		default:
 			// Skip unknown chunks
-			if _, err := d.r.Discard(int(header.Size)); err != nil {
+			if _, err := d.r.Seek(int64(header.Size), io.SeekCurrent); err != nil {
 				return err
 			}
 		}
@@ -315,7 +321,7 @@ func (d *Demuxer) parseStrlList(size uint32) error {
 		bytesRead += header.Size
 		// Align to word boundary
 		if header.Size&1 == 1 {
-			d.r.ReadByte()
+			d.r.Seek(1, io.SeekCurrent)
 			bytesRead++
 		}
 	}
@@ -347,6 +353,7 @@ func (d *Demuxer) ReadPacket() (av.Packet, error) {
 	}
 
 	entry := d.indexEntries[d.currentFrame]
+	frameNumber := d.currentFrame
 	d.currentFrame++
 
 	// Determine stream index from chunk ID
@@ -370,14 +377,6 @@ func (d *Demuxer) ReadPacket() (av.Packet, error) {
 		}
 	}
 
-	// Read the chunk data
-	data := make([]byte, entry.Size)
-	// Note: In a real implementation, we'd need to seek to the correct position
-	// For now, we'll assume sequential reading
-	if _, err := io.ReadFull(d.r, data); err != nil {
-		return av.Packet{}, err
-	}
-
 	// Calculate timestamp
 	info := d.streamInfos[streamIdx]
 	var ts time.Duration
@@ -385,13 +384,44 @@ func (d *Demuxer) ReadPacket() (av.Packet, error) {
 		// For video, use frame number and fps
 		if info.streamHeader.Rate > 0 && info.streamHeader.Scale > 0 {
 			fps := float64(info.streamHeader.Rate) / float64(info.streamHeader.Scale)
-			ts = time.Duration(float64(d.currentFrame-1) * float64(time.Second) / fps)
+			ts = time.Duration(float64(frameNumber) * float64(time.Second) / fps)
 		}
 	} else if info.isAudio {
 		// For audio, use sample count
 		if info.streamHeader.Rate > 0 {
-			ts = time.Duration(d.currentFrame-1) * time.Second / time.Duration(info.streamHeader.Rate)
+			ts = time.Duration(frameNumber) * time.Second / time.Duration(info.streamHeader.Rate)
 		}
+	}
+
+	// Seek to the correct position in the file
+	// moviOffset points to after "movi" fourcc, which is start of movi data area
+	// Index offset is relative to this position
+	absoluteOffset := d.moviOffset + int64(entry.Offset)
+	if _, err := d.r.Seek(absoluteOffset, io.SeekStart); err != nil {
+		return av.Packet{}, err
+	}
+
+	// Read chunk header to verify
+	var chunkHeader [8]byte
+	if _, err := io.ReadFull(d.r, chunkHeader[:]); err != nil {
+		return av.Packet{}, err
+	}
+
+	// Verify chunk ID matches
+	readChunkID := binary.LittleEndian.Uint32(chunkHeader[0:4])
+	readChunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
+	
+	if readChunkID != entry.ChunkID {
+		// Debug: let's see what we actually read vs expected
+		expectedID := aviio.FourCCString(entry.ChunkID)
+		actualID := aviio.FourCCString(readChunkID)
+		return av.Packet{}, fmt.Errorf("chunk ID mismatch: expected %s, got %s at offset %d", expectedID, actualID, absoluteOffset)
+	}
+
+	// Read the actual chunk data
+	data := make([]byte, readChunkSize)
+	if _, err := io.ReadFull(d.r, data); err != nil {
+		return av.Packet{}, err
 	}
 
 	return av.Packet{
@@ -402,8 +432,3 @@ func (d *Demuxer) ReadPacket() (av.Packet, error) {
 	}, nil
 }
 
-func (d *Demuxer) getPosition() (int64, error) {
-	// This is a simplified position tracking
-	// In a real implementation, we'd need to track the actual file position
-	return 0, nil
-}
